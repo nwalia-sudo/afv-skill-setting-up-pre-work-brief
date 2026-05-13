@@ -707,15 +707,63 @@ sf data update record --target-org "$ORG_ALIAS" \
   --values "PreWorkBriefPromptTemplate=$TEMPLATE_ID"
 ```
 
-**8d. Verify.**
+**8d. Schedule the Work Order's Service Appointment for today.**
+
+The Field Service Mobile app shows technicians their schedule for today. Even if a Work Order has the prompt template Id set, the technician won't see it on their mobile schedule unless the related Service Appointment falls in today's date window. The skill updates the Service Appointment's `SchedStartTime` and `SchedEndTime` to a 2-hour window in the next few hours, and also sets the Work Order's `StartDate` and `EndDate` to today.
+
+```bash
+SA_ID=$(sf data query --target-org "$ORG_ALIAS" \
+  --query "SELECT Id FROM ServiceAppointment WHERE ParentRecordId = '$WO_ID' LIMIT 1" --json | \
+  jq -r '.result.records[0].Id // empty')
+
+# Compute timestamps in UTC. Window: 1 hour from now, 2 hours long.
+# macOS / BSD date:
+START_TIME=$(date -u -v+1H +"%Y-%m-%dT%H:00:00.000Z" 2>/dev/null || \
+  # GNU date fallback:
+  date -u -d '+1 hour' +"%Y-%m-%dT%H:00:00.000Z")
+END_TIME=$(date -u -v+3H +"%Y-%m-%dT%H:00:00.000Z" 2>/dev/null || \
+  date -u -d '+3 hours' +"%Y-%m-%dT%H:00:00.000Z")
+TODAY=$(date -u +"%Y-%m-%d")
+
+echo "Scheduling Work Order $WO_ID for today:"
+echo "  WO StartDate / EndDate: $TODAY"
+echo "  SA SchedStartTime: $START_TIME"
+echo "  SA SchedEndTime:   $END_TIME"
+
+# Update Work Order date window:
+sf data update record --target-org "$ORG_ALIAS" \
+  --sobject WorkOrder --record-id "$WO_ID" \
+  --values "StartDate=$TODAY EndDate=$TODAY"
+
+# Update Service Appointment if one exists:
+if [ -n "$SA_ID" ]; then
+  sf data update record --target-org "$ORG_ALIAS" \
+    --sobject ServiceAppointment --record-id "$SA_ID" \
+    --values "SchedStartTime=$START_TIME SchedEndTime=$END_TIME"
+else
+  echo "  Note: no Service Appointment found for this Work Order. The technician"
+  echo "  may not see the WO in today's schedule. Either pick a Work Order that"
+  echo "  has a Service Appointment, or create one manually before testing."
+fi
+```
+
+Some Field Service orgs assign the Service Appointment to a specific Service Resource; if that's the case, the Work Order will only appear on that resource's schedule. If the auto-picked Work Order's appointment is assigned to a different resource than the chosen technician, either pick a Work Order whose appointment is already assigned to the technician, or assign one manually.
+
+**8e. Verify all updates.**
 
 ```bash
 sf data query --target-org "$ORG_ALIAS" \
-  --query "SELECT Id, WorkOrderNumber, PreWorkBriefPromptTemplate FROM WorkOrder WHERE Id = '$WO_ID'" \
+  --query "SELECT WorkOrderNumber, PreWorkBriefPromptTemplate, StartDate, EndDate FROM WorkOrder WHERE Id = '$WO_ID'" \
   --json | jq -r '.result.records[0]'
+
+if [ -n "$SA_ID" ]; then
+  sf data query --target-org "$ORG_ALIAS" \
+    --query "SELECT AppointmentNumber, SchedStartTime, SchedEndTime, Status FROM ServiceAppointment WHERE Id = '$SA_ID'" \
+    --json | jq -r '.result.records[0]'
+fi
 ```
 
-Confirm `PreWorkBriefPromptTemplate` matches `$TEMPLATE_ID`.
+Confirm `PreWorkBriefPromptTemplate` matches `$TEMPLATE_ID`, dates fall on today, and the Service Appointment time window is in the next few hours.
 
 **8e. (Optional) Roll out to many Work Orders.** Once the test Work Order works on-device (step 9), set the field on additional Work Orders. Two patterns:
 
