@@ -583,7 +583,45 @@ grep -c "PreWorkBriefPromptTemplate" "force-app/main/default/layouts/$LAYOUT_FUL
 
 Expect `1`. The field is now visible to anyone whose profile is assigned this layout.
 
-**7d. Field-level security.** The `PreWorkBriefPromptTemplate` field needs **Visible** access on the technician's profile. Confirm in Setup → Object Manager → Work Order → Fields & Relationships → Pre-Work Brief Prompt Template ID → Set Field-Level Security. (CLI access via `Profile` metadata deploy is possible but adds risk to other field permissions; safer to do this one click in Setup.)
+**7d. Grant field-level security via a scoped permission set.**
+
+The `PreWorkBriefPromptTemplate` field needs Read/Edit access on every user who interacts with Pre-Work Brief: the admin (to set the field on test Work Orders) and the technician (so the field renders correctly on the mobile record page).
+
+Rather than editing the technician's Profile XML directly (risky — Profile deploys can stomp on unrelated FLS settings), the skill deploys a tiny dedicated permission set and assigns it to both users. Idempotent and scoped.
+
+```bash
+mkdir -p /tmp/pwb-fls/force-app/main/default/permissionsets
+cat > /tmp/pwb-fls/sfdx-project.json <<'EOF'
+{"packageDirectories":[{"path":"force-app","default":true}],"namespace":"","sourceApiVersion":"62.0"}
+EOF
+cat > /tmp/pwb-fls/force-app/main/default/permissionsets/PreWorkBrief_Field_Access.permissionset-meta.xml <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <description>Grants Read/Edit on Work Order.PreWorkBriefPromptTemplate. Assign to admins (so they can set the field on test Work Orders) and to mobile technicians (so the field is readable when the brief renders).</description>
+    <hasActivationRequired>false</hasActivationRequired>
+    <label>Pre-Work Brief Field Access</label>
+    <fieldPermissions>
+        <editable>true</editable>
+        <field>WorkOrder.PreWorkBriefPromptTemplate</field>
+        <readable>true</readable>
+    </fieldPermissions>
+</PermissionSet>
+EOF
+
+cd /tmp/pwb-fls
+sf project deploy start --target-org "$ORG_ALIAS" --source-dir force-app --wait 5
+
+# Assign to admin and technician:
+sf org assign permset --name PreWorkBrief_Field_Access --on-behalf-of "$ADMIN_USERNAME" --target-org "$ORG_ALIAS"
+sf org assign permset --name PreWorkBrief_Field_Access --on-behalf-of "$TECH_USERNAME" --target-org "$ORG_ALIAS"
+
+# Verify:
+sf data query --target-org "$ORG_ALIAS" \
+  --query "SELECT Assignee.Username FROM PermissionSetAssignment WHERE PermissionSet.Name = 'PreWorkBrief_Field_Access'" \
+  --json | jq -r '.result.records[]? | "  \(.Assignee.Username)"'
+```
+
+Expect both `$ADMIN_USERNAME` and `$TECH_USERNAME` to appear in the verify output.
 
 ### Step 8: Set the prompt template Id on a test Work Order
 
