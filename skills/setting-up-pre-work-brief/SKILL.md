@@ -623,9 +623,18 @@ sf data query --target-org "$ORG_ALIAS" \
 
 Expect both `$ADMIN_USERNAME` and `$TECH_USERNAME` to appear in the verify output.
 
-### Step 8: Set the prompt template Id on a test Work Order
+### Step 8: Wire the prompt template to a Work Order for testing
 
-Each Work Order points at a prompt template via the `PreWorkBriefPromptTemplate` field. The skill writes the prompt template Id from step 5 into one specific Work Order so the admin can do a real on-device verification (step 9) before rolling out to many Work Orders.
+Each Work Order points at a prompt template via the `PreWorkBriefPromptTemplate` field. The skill gives the admin two paths: **8-existing** mutates a Work Order already in the org, or **8-fresh** creates a new test Work Order plus an auto-scheduled Service Appointment assigned to the chosen technician. Path 8-fresh is the recommended default — the admin gets a known-good test artifact without touching live records.
+
+Ask the admin: **"Create a fresh test Work Order, or set the prompt template Id on an existing one?"**
+
+- Fresh (recommended): jump to **Step 8-fresh**.
+- Existing: continue with **Step 8-existing**.
+
+### Step 8-existing: Set the prompt template Id on an existing Work Order
+
+Use this path when the admin wants to point a real, in-pipeline Work Order at the prompt template — for example, to test against a job whose data the technician already knows.
 
 **8a. Get the prompt template Id from a deploy record.**
 
@@ -769,6 +778,117 @@ Confirm `PreWorkBriefPromptTemplate` matches `$TEMPLATE_ID`, dates fall on today
 
 - **Bulk update by CSV.** Export a list of Work Order Ids, build a CSV with `Id,PreWorkBriefPromptTemplate`, and use `sf data import bulk`.
 - **Auto-fill via a Flow.** Salesforce's documented production pattern: a record-triggered Flow on Work Order creation that sets `PreWorkBriefPromptTemplate` based on Work Type, Subject, or any other rule. Use the afv-library `generating-flow` skill to build the Flow. See `help.salesforce.com/s/articleView?id=platform.flow.htm`.
+
+### Step 8-fresh: Create a fresh test Work Order + Service Appointment
+
+A fresh record is cleaner than mutating one in the org's existing pipeline. Existing operations keep working, and the admin gets a clearly-labeled artifact to validate Pre-Work Brief end-to-end.
+
+The path needs a Service Resource so the auto-created Service Appointment lands on a real technician's schedule. The skill defaults to the technician chosen in Step 0.5; if that user doesn't have a `ServiceResource` row, the admin supplies one.
+
+**8-fresh-a. Resolve the Service Resource.**
+
+```bash
+SERVICE_RESOURCE_ID=$(sf data query --target-org "$ORG_ALIAS" \
+  --query "SELECT Id FROM ServiceResource WHERE RelatedRecordId = '$TECH_USER_ID' AND IsActive = true LIMIT 1" --json | \
+  jq -r '.result.records[0].Id // empty')
+
+if [ -z "$SERVICE_RESOURCE_ID" ]; then
+  echo "No active ServiceResource found for technician $TECH_USERNAME."
+  echo "Available active technician resources:"
+  sf data query --target-org "$ORG_ALIAS" \
+    --query "SELECT Id, Name, RelatedRecord.Username FROM ServiceResource WHERE IsActive = true AND ResourceType = 'T' AND RelatedRecord.IsActive = true ORDER BY Name LIMIT 10" \
+    --json | jq -r '.result.records[]? | "  \(.Id) | \(.Name) | \(.RelatedRecord.Username)"'
+  echo ""
+  echo "Re-run with --service-resource <Id> to pick one, or assign a ServiceResource to $TECH_USERNAME first."
+  exit 1
+fi
+
+echo "Service Resource: $SERVICE_RESOURCE_ID"
+```
+
+**8-fresh-b. Pick an Account to attach the test WO to.**
+
+```bash
+TEST_ACCOUNT_ID=$(sf data query --target-org "$ORG_ALIAS" \
+  --query "SELECT Id, Name FROM Account WHERE IsDeleted = false ORDER BY CreatedDate DESC LIMIT 1" --json | \
+  jq -r '.result.records[0].Id')
+
+echo "Attaching test WO to Account Id: $TEST_ACCOUNT_ID"
+```
+
+If the org has no Accounts, ask the admin to supply one or create a quick test Account first.
+
+**8-fresh-c. Create the Work Order with the prompt template Id pre-filled.**
+
+```bash
+TODAY=$(date -u +"%Y-%m-%d")
+START_TIME=$(date -u -v+1H +"%Y-%m-%dT%H:00:00.000Z" 2>/dev/null || date -u -d '+1 hour' +"%Y-%m-%dT%H:00:00.000Z")
+END_TIME=$(date -u -v+3H +"%Y-%m-%dT%H:00:00.000Z" 2>/dev/null || date -u -d '+3 hours' +"%Y-%m-%dT%H:00:00.000Z")
+
+WO_ID=$(sf data create record --target-org "$ORG_ALIAS" --sobject WorkOrder \
+  --values "Subject='PWB Test (auto-created)' AccountId=$TEST_ACCOUNT_ID Status='New' StartDate=$TODAY EndDate=$TODAY PreWorkBriefPromptTemplate=$TEMPLATE_ID" \
+  --json | jq -r '.result.id')
+
+echo "✓ Work Order: $WO_ID"
+
+sf data query --target-org "$ORG_ALIAS" \
+  --query "SELECT WorkOrderNumber, Subject, PreWorkBriefPromptTemplate FROM WorkOrder WHERE Id = '$WO_ID'" \
+  --json | jq -r '.result.records[0]'
+```
+
+If the create fails on `PreWorkBriefPromptTemplate` not being writable, assign the `PreWorkBrief_Field_Access` permission set (deployed in Step 7d) to the admin running this skill, then retry.
+
+**8-fresh-d. Create the Service Appointment scheduled for today.**
+
+The Service Appointment needs a Service Territory in most orgs (the field is technically nillable but populated territories are the norm in real configurations and several orgs require one). Resolve the territory the chosen Service Resource is a member of and pass it on create.
+
+```bash
+SERVICE_TERRITORY_ID=$(sf data query --target-org "$ORG_ALIAS" \
+  --query "SELECT ServiceTerritoryId FROM ServiceTerritoryMember WHERE ServiceResourceId = '$SERVICE_RESOURCE_ID' AND EffectiveEndDate = null LIMIT 1" --json | \
+  jq -r '.result.records[0].ServiceTerritoryId // empty')
+
+echo "Service Territory: ${SERVICE_TERRITORY_ID:-<none — will create SA without territory>}"
+
+SA_VALUES="ParentRecordId=$WO_ID Subject='PWB Test (auto-created)' SchedStartTime=$START_TIME SchedEndTime=$END_TIME EarliestStartTime=$START_TIME DueDate=$END_TIME Status=Scheduled"
+[ -n "$SERVICE_TERRITORY_ID" ] && SA_VALUES="$SA_VALUES ServiceTerritoryId=$SERVICE_TERRITORY_ID"
+
+SA_ID=$(sf data create record --target-org "$ORG_ALIAS" --sobject ServiceAppointment \
+  --values "$SA_VALUES" --json | jq -r '.result.id')
+
+echo "✓ Service Appointment: $SA_ID"
+```
+
+If the create still fails with a Service Territory error and the resource has no `ServiceTerritoryMember`, ask the admin to either pick a different resource or add the resource to a territory in Setup → Service Territories.
+
+**8-fresh-e. Assign the Service Appointment to the Service Resource.**
+
+```bash
+AR_ID=$(sf data create record --target-org "$ORG_ALIAS" --sobject AssignedResource \
+  --values "ServiceAppointmentId=$SA_ID ServiceResourceId=$SERVICE_RESOURCE_ID" \
+  --json | jq -r '.result.id')
+
+echo "✓ AssignedResource: $AR_ID"
+```
+
+**8-fresh-f. Verify the chain end-to-end.**
+
+```bash
+echo ""
+echo "Test artifact summary:"
+sf data query --target-org "$ORG_ALIAS" \
+  --query "SELECT WorkOrderNumber, Subject, Account.Name, PreWorkBriefPromptTemplate, StartDate FROM WorkOrder WHERE Id = '$WO_ID'" \
+  --json | jq -r '.result.records[0]'
+
+sf data query --target-org "$ORG_ALIAS" \
+  --query "SELECT AppointmentNumber, SchedStartTime, SchedEndTime, Status FROM ServiceAppointment WHERE Id = '$SA_ID'" \
+  --json | jq -r '.result.records[0]'
+
+sf data query --target-org "$ORG_ALIAS" \
+  --query "SELECT ServiceResource.Name, ServiceResource.RelatedRecord.Username FROM AssignedResource WHERE Id = '$AR_ID'" \
+  --json | jq -r '.result.records[0]'
+```
+
+The admin can now sign in as `$TECH_USERNAME` on the Field Service mobile app and find the auto-created Work Order on today's schedule. Skip ahead to Step 9 for on-device verification.
 
 ### Step 9: Verify on a mobile device
 
