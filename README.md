@@ -1,8 +1,11 @@
-# setting-up-pre-work-brief
+# Pre-Work Brief skills
 
-An [Agentforce Vibes](https://github.com/forcedotcom/afv-library) skill that walks an admin through setting up Pre-Work Brief on Field Service Mobile in a Salesforce org, end to end, mostly via CLI.
+Two [Agentforce Vibes](https://github.com/forcedotcom/afv-library) skills for Pre-Work Brief on Field Service Mobile:
 
-This is an early candidate for contribution to `forcedotcom/afv-library`. The folder structure mirrors that repo: `skills/setting-up-pre-work-brief/SKILL.md`. When the skill is ready to merge upstream, the contents drop in unchanged.
+1. **`setting-up-pre-work-brief`** — sets up Pre-Work Brief end to end against a Salesforce org with the default managed flow and the standard prompt template.
+2. **`customizing-pre-work-brief`** — generates a vertical-specific brief deployable as code. Ships with seed templates for HVAC, banking, telecom, healthcare, and retail merchandising under `templates/`. The admin provides industry, website, and a sentence about what their technicians do; the skill produces custom objects, an autolaunched flow, a prompt template, a permission set, and a test Work Order — all from metadata. Ends by creating a fresh test WO + SA assigned to a Service Resource so the admin can validate on-device immediately.
+
+Both are early candidates for contribution to `forcedotcom/afv-library`. The folder structure mirrors that repo: each skill lives at `skills/<name>/SKILL.md`. When the skills are ready to merge upstream, the folders drop in unchanged.
 
 ## What is Pre-Work Brief
 
@@ -16,7 +19,7 @@ Salesforce documents the manual setup at:
 
 The skill automates as many of the documented steps as can be driven from the Salesforce CLI, and surfaces clear deeplinks for the few that still require a click in Setup.
 
-## What the skill does
+## What `setting-up-pre-work-brief` does
 
 In order:
 
@@ -31,23 +34,57 @@ In order:
 | 5 | Deploys (or detects) the Pre-Work Brief prompt template, then surfaces the activation deeplink | `sf project deploy start` of a `GenAiPromptTemplate` metadata file + `sf org open --url-only` |
 | 6 | Verifies the Work Order grounding fields exist | `sf sobject describe` |
 | 7 | Adds the `PreWorkBriefPromptTemplate` field to the Work Order layout assigned to the technician | Metadata retrieve + Python edit + redeploy |
-| 8 | Sets the prompt template Id on a test Work Order (admin's pick or auto-pick) | `sf data update record` |
+| 8 | Wires the prompt template to a Work Order — either an existing record or a fresh auto-created WO + SA assigned to the chosen technician's Service Resource | `sf data update record` or `sf data create record` chain |
 | 9 | Documents on-device verification | Manual mobile test |
+
+## What `customizing-pre-work-brief` does
+
+Runs after the base setup is complete. Generator-style: the admin specifies an industry, a company name, and a website; the skill produces a deployable bundle (custom objects, flow, prompt template, permission set, test record) tailored to that vertical.
+
+| Step | What it does | How |
+|---|---|---|
+| Pre | Confirms `setting-up-pre-work-brief` artifacts exist | `sf org list metadata`, `sf data query`, `sf sobject describe` |
+| 1 | Builds business context from `--website` (via WebFetch) and a 1-2 sentence admin description | Tool call + admin prompt |
+| 2 | Loads the vertical seed template from `templates/<industry>.md` (or synthesizes one if the seed is missing) | File read |
+| 3 | Audits the org's existing schema; cross-references against the seed's recommended custom objects to avoid duplicates | `sf sobject describe`, `sf sobject list` |
+| 4 | Generates and deploys the approved custom objects, fields, and any new WorkOrder lookups | Metadata deploy of `CustomObject`, `CustomField` |
+| 5 | Generates a from-scratch autolaunched `PromptFlow` flow with `Capability` trigger type — no Save-As click required — and activates it via `FlowDefinition.Metadata.activeVersionNumber` | `sf project deploy start` of `Flow`, then Tooling REST PATCH |
+| 6 | Generates the `GenAiPromptTemplate` referencing the new flow, with business-context paragraph + section structure from the seed; surfaces activation deeplink | `sf project deploy start` + `sf org open --url-only` |
+| 7 | Generates a permission set granting CRUD + FLS on the new objects/fields; assigns to admin + technician | Metadata deploy + `sf org assign permset` |
+| 8 | Creates a fresh test Work Order with sample seed data populating the new customs, plus SA + AssignedResource | `sf data create record` chain |
 
 The two steps that still need a click in Setup are:
 
-- **Step 3** — Salesforce's base Einstein generative AI setup (link given).
-- **Step 5 activation** — the prompt template's "Activate" button in Prompt Builder. The skill emits a one-time signed deeplink direct to the template editor so it's a single click.
+- **Step 3** of `setting-up-pre-work-brief` — Salesforce's base Einstein generative AI setup (link given).
+- **Step 6 activation** — the prompt template's "Activate" button in Prompt Builder. The skill emits a one-time signed deeplink direct to the template editor so it's a single click. (The flow itself is activated programmatically in Step 5.)
+
+### Seed templates
+
+`skills/customizing-pre-work-brief/templates/` ships with five vertical seeds:
+
+| Seed | Status | Recommended custom objects |
+|---|---|---|
+| `hvac.md` | **Verified end-to-end against `afvuser` 2026-05-20** | `Maintenance_Contract__c`, `Refrigerant_Log__c` |
+| `banking.md` | Scaffold (untested) | `ATM_Cassette__c`, `Compliance_Check__c` |
+| `telecom.md` | Scaffold (untested) | `Service_Drop__c`, `Outage_History__c` |
+| `healthcare.md` | Scaffold (untested) | `Device_Calibration__c`, `FDA_Compliance_Log__c` |
+| `retail-merchandising.md` | Scaffold (untested) | `Store_Visit_Plan__c`, `Planogram_Compliance__c` |
+
+Each seed contributes a section structure for the prompt template, recommended custom objects with field lists, standard fields to query, and a cadence example. For verticals not in the library, pass `--industry other` and the skill synthesizes from the website + admin description.
 
 ## How to use it
 
-The skill is consumed by an AI coding agent (Claude Code, Agentforce Vibes, Cursor, Codex, etc.) that supports the Agent Skills format. Drop `skills/setting-up-pre-work-brief/SKILL.md` into your skills directory; the agent picks it up via the `description` frontmatter.
+Both skills are consumed by an AI coding agent (Claude Code, Agentforce Vibes, Cursor, Codex, etc.) that supports the Agent Skills format. Drop the `skills/<name>/SKILL.md` files into your skills directory; the agent picks them up via the `description` frontmatter.
 
-Run the skill against an org by asking the agent something like:
+Run the base skill against an org by asking:
 
 > Set up Pre-Work Brief on the `<org-alias>` Salesforce org.
 
-The agent walks the steps in order, asks for the technician's username (or auto-picks), and surfaces the activation deeplink at step 5.
+After base setup is in place, layer customization with:
+
+> Customize Pre-Work Brief for `<company>` (industry: `<hvac|banking|telecom|healthcare|retail-merchandising|other>`) on `<org-alias>`. Their website is `<url>`.
+
+The agent walks the steps in order, surfaces the activation deeplinks at the prompt-template steps, and creates a fresh test Work Order so the admin can validate on-device immediately.
 
 ## Prerequisites
 
@@ -58,7 +95,12 @@ The agent walks the steps in order, asks for the technician's username (or auto-
 
 ## Tested against
 
-`afvuser@salesforce.com` trial org, May 2026. Steps 0 through 8 ran cleanly. Step 9 (mobile-device verification) requires a working Einstein LLM runtime entitlement, which isn't provisioned in all trial orgs — track that as a separate org-provisioning question if you hit "We hit a snag" on mobile.
+`afvuser@salesforce.com` trial org, May 2026.
+
+- `setting-up-pre-work-brief` Steps 0 through 8 verified clean. Step 9 (mobile-device verification) requires a working Einstein LLM runtime entitlement.
+- `customizing-pre-work-brief` HVAC seed verified end-to-end on 2026-05-20: 2 custom objects + 11 fields deployed, from-scratch flow built and activated programmatically, prompt template deployed, permission set assigned, test WO 00000325 created with full sample data. The other four seeds (banking, telecom, healthcare, retail-merchandising) are scaffolds and need an end-to-end run before customer use.
+
+Step 9 (mobile-device verification) requires a working Einstein LLM runtime entitlement, which isn't provisioned in all trial orgs — track that as a separate org-provisioning question if you hit "We hit a snag" on mobile.
 
 ## Limitations
 
@@ -72,4 +114,13 @@ The agent walks the steps in order, asks for the technician's username (or auto-
 
 ## Contributing
 
-Open an issue or PR. When the skill is ready for upstream contribution, the entire `skills/setting-up-pre-work-brief/` folder will be copied into `forcedotcom/afv-library` via a fork-based PR.
+Open an issue or PR. When the skills are ready for upstream contribution, the entire `skills/setting-up-pre-work-brief/` and `skills/customizing-pre-work-brief/` folders will be copied into `forcedotcom/afv-library` via a fork-based PR.
+
+### Adding a new vertical seed
+
+To contribute a seed for a vertical not in the library:
+
+1. Run `customizing-pre-work-brief` with `--industry other` against a real org for that vertical. The skill writes a draft seed at `templates/<your-industry>.md` at the end of the run.
+2. Review the draft. Each seed should contain: business archetype, recommended custom objects (with field lists + rationale), standard objects to query, prompt template section structure, vertical-specific rules, cadence example, and test data sample. See `templates/hvac.md` as the canonical reference.
+3. Verify the seed end-to-end against the org by re-running with `--industry <your-industry>`.
+4. Open a PR adding the seed.
